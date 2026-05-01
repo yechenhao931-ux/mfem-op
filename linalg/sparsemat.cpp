@@ -12,6 +12,7 @@
 // Implementation of sparse matrix
 
 #include "linalg.hpp"
+#include "cpu_kernels.hpp"
 #include "../general/forall.hpp"
 #include "../general/table.hpp"
 #include "../general/sort_pairs.hpp"
@@ -865,9 +866,15 @@ void SparseMatrix::AddMult(const Vector &x, Vector &y, const real_t a) const
 #endif // CUDA_VERSION >= 10010 || defined(MFEM_USE_HIP)
 #endif // MFEM_USE_CUDA_OR_HIP
    }
+   else if (!Device::Allows(Backend::DEVICE_MASK))
+   {
+      // Optimized host path: thread + SIMD parallel CSR SpMV.
+      // See linalg/cpu_kernels.hpp for the kernel and rationale.
+      cpu_kernels::CSRAddMult(height, d_I, d_J, d_A, d_x, d_y, a);
+   }
    else
    {
-      // Native version
+      // Native (forall) version: dispatched to GPU/RAJA/OCCA backends.
       mfem::forall(height, [=] MFEM_HOST_DEVICE (int i)
       {
          real_t d = 0.0;
@@ -947,16 +954,10 @@ void SparseMatrix::AddMultTranspose(const Vector &x, Vector &y,
       const int *Jp = HostRead(J, nnz);
       const real_t *Ap = HostRead(A, nnz);
 
-      for (int i = 0; i < height; i++)
-      {
-         const real_t xi = a * xp[i];
-         const int end = Ip[i+1];
-         for (int j = Ip[i]; j < end; j++)
-         {
-            const int Jj = Jp[j];
-            yp[Jj] += Ap[j] * xi;
-         }
-      }
+      // Optimized host transpose SpMV with per-thread scratch. Falls back to
+      // the previous serial loop when OpenMP is disabled or the row count is
+      // small.
+      cpu_kernels::CSRAddMultTranspose(height, width, Ip, Jp, Ap, xp, yp, a);
    }
 }
 
@@ -1116,16 +1117,23 @@ void SparseMatrix::AbsMult(const Vector &x, Vector &y) const
    auto d_A = Read(A, nnz);
    auto d_x = x.Read();
    auto d_y = y.ReadWrite();
-   mfem::forall(height, [=] MFEM_HOST_DEVICE (int i)
+   if (!Device::Allows(Backend::DEVICE_MASK))
    {
-      real_t d = 0.0;
-      const int end = d_I[i+1];
-      for (int j = d_I[i]; j < end; j++)
+      cpu_kernels::CSRAddAbsMult(height, d_I, d_J, d_A, d_x, d_y);
+   }
+   else
+   {
+      mfem::forall(height, [=] MFEM_HOST_DEVICE (int i)
       {
-         d += std::abs(d_A[j]) * d_x[d_J[j]];
-      }
-      d_y[i] += d;
-   });
+         real_t d = 0.0;
+         const int end = d_I[i+1];
+         for (int j = d_I[i]; j < end; j++)
+         {
+            d += std::abs(d_A[j]) * d_x[d_J[j]];
+         }
+         d_y[i] += d;
+      });
+   }
 }
 
 void SparseMatrix::AbsMultTranspose(const Vector &x, Vector &y) const

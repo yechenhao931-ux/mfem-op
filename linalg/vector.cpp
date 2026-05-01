@@ -15,6 +15,7 @@
 #include "../general/reducers.hpp"
 #include "../general/hash.hpp"
 #include "../general/scan.hpp"
+#include "cpu_kernels.hpp"
 #include "vector.hpp"
 
 #ifdef MFEM_USE_OPENMP
@@ -331,6 +332,15 @@ Vector &Vector::Add(const real_t a, const Vector &Va)
    {
       const int N = size;
       const bool use_dev = UseDevice() || Va.UseDevice();
+      // Fast host path: explicit OpenMP + SIMD AXPY when not running on a
+      // device backend. The generic forall path is preserved for GPU.
+      if (!use_dev && !Device::Allows(Backend::DEVICE_MASK))
+      {
+         const real_t *xp = Va.HostRead();
+         real_t *yp = HostReadWrite();
+         cpu_kernels::Axpy(N, a, xp, yp);
+         return *this;
+      }
       const auto x = Va.Read(use_dev);
       auto y = ReadWrite(use_dev);
       mfem::forall_switch(use_dev, N, [=] MFEM_HOST_DEVICE (int i) { y[i] += a * x[i]; });
@@ -1146,6 +1156,13 @@ real_t Vector::operator*(const Vector &v) const
 #endif // MFEM_USE_OPENMP_DETERMINISTIC_DOT
    }
 #endif // MFEM_USE_OPENMP
+
+   // Fast host path with explicit SIMD/OpenMP reduction. Picked when no
+   // device or OMP backend is selected, but the data lives on the host.
+   if (!use_dev)
+   {
+      return cpu_kernels::Dot(size, m_data, v_data);
+   }
 
    // All other CPU backends
    return compute_dot();
