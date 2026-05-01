@@ -225,6 +225,104 @@ inline real_t Dot(const int N,
    return s;
 }
 
+// ---------------------------------------------------------------------------
+// Vector sum: returns sum_i x[i]
+// ---------------------------------------------------------------------------
+inline real_t Sum(const int N, const real_t *MFEM_CPU_RESTRICT x)
+{
+   real_t s = 0.0;
+#if defined(MFEM_USE_OPENMP)
+   #pragma omp parallel for simd reduction(+:s) schedule(static) \
+      if (N >= omp_threshold)
+#endif
+   for (int i = 0; i < N; i++)
+   {
+      s += x[i];
+   }
+   return s;
+}
+
+// ---------------------------------------------------------------------------
+// Vector min / max: assume N > 0.
+// ---------------------------------------------------------------------------
+inline real_t Min(const int N, const real_t *MFEM_CPU_RESTRICT x)
+{
+   real_t m = x[0];
+#if defined(MFEM_USE_OPENMP)
+   #pragma omp parallel for simd reduction(min:m) schedule(static) \
+      if (N >= omp_threshold)
+#endif
+   for (int i = 0; i < N; i++)
+   {
+      m = (x[i] < m) ? x[i] : m;
+   }
+   return m;
+}
+
+inline real_t Max(const int N, const real_t *MFEM_CPU_RESTRICT x)
+{
+   real_t m = x[0];
+#if defined(MFEM_USE_OPENMP)
+   #pragma omp parallel for simd reduction(max:m) schedule(static) \
+      if (N >= omp_threshold)
+#endif
+   for (int i = 0; i < N; i++)
+   {
+      m = (x[i] > m) ? x[i] : m;
+   }
+   return m;
+}
+
+// ---------------------------------------------------------------------------
+// Dense GEMV (column-major): y += a * A * x, where A is height x width with
+// data stored column-major (MFEM's DenseMatrix layout). The outer column loop
+// is sequential, the inner row loop is contiguous-stride: ideal for SIMD.
+// Threading splits the row range so writes to y[] are disjoint.
+// ---------------------------------------------------------------------------
+inline void DenseAddMult(const int height, const int width,
+                         const real_t *MFEM_CPU_RESTRICT data,
+                         const real_t *MFEM_CPU_RESTRICT x,
+                         real_t *MFEM_CPU_RESTRICT y,
+                         const real_t a = 1.0)
+{
+#if defined(MFEM_USE_OPENMP)
+   if (height >= omp_threshold)
+   {
+      #pragma omp parallel
+      {
+         const int nthreads = omp_get_num_threads();
+         const int tid = omp_get_thread_num();
+         const int chunk = (height + nthreads - 1) / nthreads;
+         const int rlo = tid * chunk;
+         const int rhi = (rlo + chunk < height) ? rlo + chunk : height;
+         for (int col = 0; col < width; col++)
+         {
+            const real_t xc = a * x[col];
+            const real_t *MFEM_CPU_RESTRICT d_col = data + (std::size_t)col * height;
+            #pragma omp simd
+            for (int row = rlo; row < rhi; row++)
+            {
+               y[row] += xc * d_col[row];
+            }
+         }
+      }
+      return;
+   }
+#endif
+   for (int col = 0; col < width; col++)
+   {
+      const real_t xc = a * x[col];
+      const real_t *MFEM_CPU_RESTRICT d_col = data + (std::size_t)col * height;
+      #if defined(MFEM_USE_OPENMP)
+      #pragma omp simd
+      #endif
+      for (int row = 0; row < height; row++)
+      {
+         y[row] += xc * d_col[row];
+      }
+   }
+}
+
 } // namespace cpu_kernels
 } // namespace mfem
 

@@ -1210,6 +1210,9 @@ real_t Vector::Min() const
    }
 #endif
 
+   // Fast host path with explicit SIMD/OpenMP min reduction
+   if (!use_dev) { return cpu_kernels::Min(size, m_data); }
+
    // All other CPU backends
    return compute_min();
 }
@@ -1256,6 +1259,9 @@ real_t Vector::Max() const
    }
 #endif
 
+   // Fast host path with explicit SIMD/OpenMP max reduction
+   if (!use_dev) { return cpu_kernels::Max(size, m_data); }
+
    // All other CPU backends
    return compute_max();
 }
@@ -1264,13 +1270,18 @@ real_t Vector::Sum() const
 {
    if (size == 0) { return 0.0; }
 
+   const bool use_dev = UseDevice();
+   const auto m_data = Read(use_dev);
+   if (!use_dev && !Device::Allows(Backend::DEVICE_MASK))
+   {
+      return cpu_kernels::Sum(size, m_data);
+   }
    real_t res = 0;
-   const auto m_data = Read(UseDevice());
    reduce(size, res, [=] MFEM_HOST_DEVICE(int i, real_t &r)
    {
       r += m_data[i];
    },
-   SumReducer<real_t> {}, UseDevice(), vector_workspace());
+   SumReducer<real_t> {}, use_dev, vector_workspace());
    return res;
 }
 

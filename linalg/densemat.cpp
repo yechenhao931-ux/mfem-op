@@ -14,6 +14,7 @@
 
 
 #include "kernels.hpp"
+#include "cpu_kernels.hpp"
 #include "vector.hpp"
 #include "matrix.hpp"
 #include "densemat.hpp"
@@ -202,17 +203,8 @@ void DenseMatrix::AddMult(const Vector &x, Vector &y, const real_t a) const
    MFEM_ASSERT(height == y.Size() && width == x.Size(),
                "incompatible dimensions");
 
-   const real_t *xp = x.GetData(), *d_col = data;
-   real_t *yp = y.GetData();
-   for (int col = 0; col < width; col++)
-   {
-      real_t x_col = xp[col];
-      for (int row = 0; row < height; row++)
-      {
-         yp[row] += x_col*d_col[row];
-      }
-      d_col += height;
-   }
+   // Optimized column-major host GEMV (SIMD + thread row-banding).
+   cpu_kernels::DenseAddMult(height, width, data, x.GetData(), y.GetData());
 }
 
 void DenseMatrix::AddMultTranspose(const Vector &x, Vector &y,
@@ -247,17 +239,7 @@ void DenseMatrix::AddMult_a(real_t a, const Vector &x, Vector &y) const
    HostRead();
    x.HostRead();
    y.HostReadWrite();
-   const real_t *xp = x.GetData(), *d_col = data;
-   real_t *yp = y.GetData();
-   for (int col = 0; col < width; col++)
-   {
-      const real_t x_col = a*xp[col];
-      for (int row = 0; row < height; row++)
-      {
-         yp[row] += x_col*d_col[row];
-      }
-      d_col += height;
-   }
+   cpu_kernels::DenseAddMult(height, width, data, x.GetData(), y.GetData(), a);
 }
 
 void DenseMatrix::AddMultTranspose_a(real_t a, const Vector &x,
