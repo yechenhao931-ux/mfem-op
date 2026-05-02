@@ -134,6 +134,31 @@ protected:
 
    int precompute_sparsity;
 
+   /// If true, BilinearForm::Assemble() runs element-wise integration and
+   /// scatter on multiple OpenMP threads using a DOF-aware element coloring.
+   bool threaded_assembly = false;
+
+   /// Per-element color (size NE), filled in by ComputeAssemblyColoring().
+   /// Empty when no threaded coloring has been built yet.
+   Array<int> assembly_colors;
+   /// Number of distinct colors in #assembly_colors (0 when unbuilt).
+   int assembly_num_colors = 0;
+   /// Sequence number captured when the coloring was built; used to detect
+   /// mesh refinements that invalidate the cached coloring.
+   long assembly_color_sequence = -1;
+
+   /// Build a DOF-aware coloring of the mesh elements such that any two
+   /// elements sharing at least one DOF receive different colors. Used by
+   /// the threaded Assemble() path to schedule race-free scatter.
+   void ComputeAssemblyColoring();
+
+   /// Threaded element-wise legacy assembly. Requires threaded_assembly &&
+   /// MFEM_USE_OPENMP, precompute_sparsity != 0, no boundary / interior_face
+   /// / NURBS-patch integrators, no static condensation / hybridization.
+   /// Falls back to the serial path automatically when these conditions
+   /// don't hold.
+   bool AssembleThreadedDomain(int skip_zeros);
+
    /// Allocate appropriate SparseMatrix and assign it to #mat
    void AllocMat();
 
@@ -240,6 +265,39 @@ public:
        matrix (assuming dense element matrices) based on the types of
        integrators present in the bilinear form. */
    void UsePrecomputedSparsity(int ps = 1) { precompute_sparsity = ps; }
+
+   /** @brief Enable element-level threaded assembly in Assemble().
+
+       The threaded path computes the element matrices and scatters them
+       into the global sparse matrix in parallel. To avoid races on shared
+       DOF entries it builds a DOF-aware coloring of the mesh; elements of
+       the same color have disjoint DOFs and are processed concurrently.
+
+       Conditions for the threaded path to activate (otherwise Assemble()
+       silently falls back to the serial path):
+        - The library was built with @c MFEM_USE_OPENMP=YES.
+        - The bilinear form uses precomputed sparsity (we automatically
+          enable @c UsePrecomputedSparsity(1) when threaded assembly is
+          turned on).
+        - No boundary / interior-face / trace-face / NURBS-patchwise
+          integrators are attached, and no static condensation /
+          hybridization is in use.
+        - The assembly level is LEGACY.
+
+       The integrators must be thread-safe per element (the same
+       requirement as the existing legacy OpenMP path). All built-in
+       Diffusion / Mass / Convection integrators meet this requirement
+       because their internal scratch buffers are private to each
+       AssembleElementMatrix() call. */
+   void EnableThreadedAssembly(bool b = true)
+   {
+      threaded_assembly = b;
+      if (b) { precompute_sparsity = 1; }
+   }
+
+   /// Returns true when threaded assembly was requested via
+   /// EnableThreadedAssembly().
+   bool ThreadedAssemblyEnabled() const { return threaded_assembly; }
 
    /** @brief Use the given CSR sparsity pattern to allocate the internal
        SparseMatrix.

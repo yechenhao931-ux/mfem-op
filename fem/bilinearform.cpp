@@ -16,6 +16,10 @@
 #include "../mesh/nurbs.hpp"
 #include <cmath>
 
+#ifdef MFEM_USE_OPENMP
+#include <omp.h>
+#endif
+
 namespace mfem
 {
 
@@ -453,6 +457,187 @@ void BilinearForm::AssembleBdrElementMatrix(
    }
 }
 
+void BilinearForm::ComputeAssemblyColoring()
+{
+   const long seq = fes->GetSequence();
+   if (assembly_color_sequence == seq && assembly_colors.Size() == fes->GetNE())
+   {
+      return; // already up-to-date
+   }
+
+   const int NE = fes->GetNE();
+   assembly_colors.SetSize(NE);
+   if (NE == 0) { assembly_num_colors = 0; assembly_color_sequence = seq; return; }
+
+   // Build the dof->element table by transposing fes->GetElementToDofTable().
+   // We use vdofs (incl. vdim ordering and sign-flip encoding stripped) so
+   // the conflict graph matches what AssembleElementMatrix actually writes
+   // into. For VDim>1 elements share the same scalar dofs across components,
+   // so working in the scalar elem_dof table is sufficient.
+   const Table &elem_dof = fes->GetElementToDofTable();
+   const int *I = elem_dof.GetI();
+   const int *J = elem_dof.GetJ();
+   const int ndofs = fes->GetNDofs();
+
+   Table dof_elem;
+   Transpose(elem_dof, dof_elem, ndofs);
+   const int *de_I = dof_elem.GetI();
+   const int *de_J = dof_elem.GetJ();
+
+   assembly_colors = -1;
+   // Bound on the max degree in the element-conflict graph: every DOF
+   // contributes (#elements sharing it - 1) neighbours. Reserve generously.
+   Array<int> used; used.Reserve(64);
+   int max_color = 0;
+   for (int e = 0; e < NE; e++)
+   {
+      used.SetSize(0);
+      for (int p = I[e]; p < I[e+1]; p++)
+      {
+         int d = J[p];
+         if (d < 0) { d = -1 - d; }
+         for (int q = de_I[d]; q < de_I[d+1]; q++)
+         {
+            const int e2 = de_J[q];
+            if (e2 == e) { continue; }
+            const int c = assembly_colors[e2];
+            if (c >= 0) { used.Append(c); }
+         }
+      }
+      used.Sort();
+      // Find smallest non-negative integer not in `used`.
+      int c = 0;
+      for (int k = 0; k < used.Size(); k++)
+      {
+         if (used[k] == c) { c++; }
+         else if (used[k] > c) { break; }
+      }
+      assembly_colors[e] = c;
+      if (c > max_color) { max_color = c; }
+   }
+   assembly_num_colors = max_color + 1;
+   assembly_color_sequence = seq;
+}
+
+bool BilinearForm::AssembleThreadedDomain(int skip_zeros)
+{
+#ifndef MFEM_USE_OPENMP
+   (void)skip_zeros;
+   return false;
+#else
+   // Eligibility checks: anything that doesn't fit the simple element-wise
+   // domain-only path falls through to the serial implementation.
+   if (!threaded_assembly) { return false; }
+   if (assembly != AssemblyLevel::LEGACY) { return false; }
+   if (precompute_sparsity == 0 || fes->GetVDim() > 1) { return false; }
+   if (boundary_integs.Size() || interior_face_integs.Size() ||
+       boundary_face_integs.Size()) { return false; }
+   if (static_cond || hybridization) { return false; }
+   if (fes->GetNURBSext()) { return false; }
+   for (int k = 0; k < domain_integs.Size(); k++)
+   {
+      if (domain_integs[k]->Patchwise()) { return false; }
+   }
+   if (domain_integs.Size() == 0) { return true; } // nothing to do
+
+   if (mat == NULL) { AllocMat(); }
+   MFEM_VERIFY(mat->Finalized() && mat->ColumnsAreSorted(),
+               "threaded assembly requires a finalized SparseMatrix with "
+               "sorted column indices (precomputed sparsity must be on)");
+
+   ComputeAssemblyColoring();
+
+   const int NE = fes->GetNE();
+   const int ncolors = assembly_num_colors;
+
+   // Bucket elements by color into a CSR-style structure once. This avoids
+   // a linear scan per color during the inner loop.
+   Array<int> color_offsets(ncolors + 1);
+   color_offsets = 0;
+   for (int e = 0; e < NE; e++) { color_offsets[assembly_colors[e] + 1]++; }
+   for (int c = 0; c < ncolors; c++) { color_offsets[c+1] += color_offsets[c]; }
+   Array<int> color_elems(NE);
+   {
+      Array<int> tmp(color_offsets); // running positions
+      for (int e = 0; e < NE; e++)
+      {
+         const int c = assembly_colors[e];
+         color_elems[tmp[c]++] = e;
+      }
+   }
+
+   // Pre-mark which integrators are active for each element attribute.
+   // domain_integs_marker[k] == NULL means apply everywhere.
+   for (int k = 0; k < domain_integs.Size(); k++)
+   {
+      if (domain_integs_marker[k])
+      {
+         MFEM_VERIFY(domain_integs_marker[k]->Size() ==
+                     (fes->GetMesh()->attributes.Size()
+                      ? fes->GetMesh()->attributes.Max() : 0),
+                     "invalid element marker for domain integrator #" << k);
+         domain_integs_marker[k]->HostRead();
+      }
+   }
+
+   // Loop over colors sequentially; within each color elements have
+   // pairwise-disjoint DOFs, so AddSubMatrixSorted() can be called from
+   // multiple threads without contention.
+   for (int c = 0; c < ncolors; c++)
+   {
+      const int beg = color_offsets[c];
+      const int end = color_offsets[c+1];
+
+      #pragma omp parallel
+      {
+         // Per-thread scratch — these are private buffers reused across
+         // elements to amortise allocation cost.
+         Array<int> vdofs;
+         DofTransformation doftrans;
+         IsoparametricTransformation eltrans;
+         DenseMatrix elmat, elemmat;
+
+         #pragma omp for schedule(static)
+         for (int k = beg; k < end; k++)
+         {
+            const int i = color_elems[k];
+            fes->GetElementVDofs(i, vdofs, doftrans);
+
+            DenseMatrix *elmat_p = nullptr;
+            if (element_matrices)
+            {
+               elmat_p = &(*element_matrices)(i);
+            }
+            else
+            {
+               const int elem_attr = fes->GetMesh()->GetAttribute(i);
+               fes->GetElementTransformation(i, &eltrans);
+
+               elmat.SetSize(0);
+               for (int kk = 0; kk < domain_integs.Size(); kk++)
+               {
+                  if ((domain_integs_marker[kk] == NULL ||
+                       (*(domain_integs_marker[kk]))[elem_attr-1] == 1))
+                  {
+                     domain_integs[kk]->AssembleElementMatrix(
+                        *fes->GetFE(i), eltrans, elemmat);
+                     if (elmat.Size() == 0) { elmat = elemmat; }
+                     else { elmat += elemmat; }
+                  }
+               }
+               if (elmat.Size() == 0) { continue; }
+               doftrans.TransformDual(elmat);
+               elmat_p = &elmat;
+            }
+
+            mat->AddSubMatrixSorted(vdofs, vdofs, *elmat_p, skip_zeros);
+         }
+      }
+   }
+   return true;
+#endif
+}
+
 void BilinearForm::Assemble(int skip_zeros)
 {
    if (ext)
@@ -474,6 +659,16 @@ void BilinearForm::Assemble(int skip_zeros)
       AllocMat();
    }
 
+   // Optional element-coloured threaded path (no boundary / static-cond /
+   // hybridization / NURBS / VDim>1 / face integrators). When eligible it
+   // assembles the domain integrators and we still need to drop into the
+   // serial loops below for any boundary/face/trace work.
+   bool domain_done_threaded = false;
+   if (threaded_assembly && domain_integs.Size())
+   {
+      domain_done_threaded = AssembleThreadedDomain(skip_zeros);
+   }
+
 #ifdef MFEM_USE_LEGACY_OPENMP
    int free_element_matrices = 0;
    if (!element_matrices)
@@ -483,7 +678,7 @@ void BilinearForm::Assemble(int skip_zeros)
    }
 #endif
 
-   if (domain_integs.Size())
+   if (domain_integs.Size() && !domain_done_threaded)
    {
       for (int k = 0; k < domain_integs.Size(); k++)
       {

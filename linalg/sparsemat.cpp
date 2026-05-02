@@ -2785,6 +2785,62 @@ void SparseMatrix::AddSubMatrix(const Array<int> &rows, const Array<int> &cols,
    }
 }
 
+void SparseMatrix::AddSubMatrixSorted(const Array<int> &rows,
+                                      const Array<int> &cols,
+                                      const DenseMatrix &subm,
+                                      int skip_zeros)
+{
+   MFEM_ASSERT(Finalized(), "matrix must be finalized");
+   MFEM_ASSERT(ColumnsAreSorted(),
+               "AddSubMatrixSorted requires sorted column indices "
+               "(call SparseMatrix::SortColumnIndices() once before "
+               "concurrent assembly)");
+
+   const int *__restrict__ Ip = I;
+   const int *__restrict__ Jp = J;
+   real_t   *__restrict__ Ap = A;
+
+   const int nrows = rows.Size();
+   const int ncols = cols.Size();
+   for (int i = 0; i < nrows; i++)
+   {
+      int gi = rows[i];
+      int s;
+      if (gi < 0) { gi = -1 - gi; s = -1; }
+      else { s = 1; }
+      MFEM_ASSERT(gi < height, "row index out of range: " << gi);
+      const int rb = Ip[gi];
+      const int re = Ip[gi+1];
+      for (int j = 0; j < ncols; j++)
+      {
+         int gj = cols[j];
+         int t;
+         if (gj < 0) { gj = -1 - gj; t = -s; }
+         else { t = s; }
+         real_t a = subm(i, j);
+         if (skip_zeros && a == 0.0)
+         {
+            if (skip_zeros == 2 || &rows != &cols || subm(j, i) == 0.0)
+            {
+               continue;
+            }
+         }
+         if (t < 0) { a = -a; }
+         // Binary search in J[rb..re) for gj
+         int lo = rb, hi = re;
+         while (lo < hi)
+         {
+            const int mid = (lo + hi) >> 1;
+            if (Jp[mid] < gj) { lo = mid + 1; }
+            else              { hi = mid; }
+         }
+         MFEM_ASSERT(lo < re && Jp[lo] == gj,
+                     "entry (" << gi << "," << gj << ") missing in sparsity pattern");
+         Ap[lo] += a;
+      }
+   }
+}
+
 void SparseMatrix::Set(const int i, const int j, const real_t val)
 {
    real_t a = val;

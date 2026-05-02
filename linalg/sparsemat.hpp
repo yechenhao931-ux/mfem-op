@@ -622,6 +622,18 @@ public:
    void AddSubMatrix(const Array<int> &rows, const Array<int> &cols,
                      const DenseMatrix &subm, int skip_zeros = 1);
 
+   /** @brief Thread-safe variant of AddSubMatrix(); see AddSubMatrix() for the
+       parameter semantics. Requires the matrix to be Finalized() with
+       sorted column indices (ColumnsAreSorted() == true). Each entry is
+       located by binary search inside its CSR row, so this routine never
+       touches the shared mutable @c ColPtrJ scratch buffer used by
+       AddSubMatrix() — it can therefore be called concurrently from
+       multiple threads provided that no two threads write to the same
+       (row, col) entry. The caller is responsible for ensuring this
+       (e.g. via a DOF-aware element coloring). */
+   void AddSubMatrixSorted(const Array<int> &rows, const Array<int> &cols,
+                           const DenseMatrix &subm, int skip_zeros = 1);
+
    bool RowIsEmpty(const int row) const;
 
    /// Extract all column indices and values from a given row.
