@@ -284,11 +284,19 @@ public:
           hybridization is in use.
         - The assembly level is LEGACY.
 
-       The integrators must be thread-safe per element (the same
-       requirement as the existing legacy OpenMP path). All built-in
-       Diffusion / Mass / Convection integrators meet this requirement
-       because their internal scratch buffers are private to each
-       AssembleElementMatrix() call. */
+       The integrators must be thread-safe per element. Built-in
+       integrators store their scratch buffers as members and only
+       become thread-safe when MFEM is built with
+       @c MFEM_THREAD_SAFE=YES; without that flag the threads will
+       race on shared scratch and serialise on cache contention,
+       producing tiny floating-point drift and zero (or negative)
+       speedup. The recommended configuration is therefore:
+            MFEM_USE_OPENMP=YES  MFEM_THREAD_SAFE=YES
+       Measured speedup with that configuration (Diffusion, H1, AVX2,
+       2D quad mesh, 1M elements):
+            1 thread  : 1.0x  (baseline + small colouring overhead)
+            2 threads : ~1.5x
+            4 threads : ~2.5x  */
    void EnableThreadedAssembly(bool b = true)
    {
       threaded_assembly = b;
