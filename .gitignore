@@ -70,6 +70,8 @@ examples/ex3[0-9]p
 examples/ex4[0-9]
 examples/ex4[0-9]p
 examples/perf_bench_serial
+examples/perf_bench_camm
+examples/perf_bench_assemble
 
 examples/refined.mesh
 examples/displaced.mesh

@@ -869,8 +869,31 @@ void SparseMatrix::AddMult(const Vector &x, Vector &y, const real_t a) const
    else if (!Device::Allows(Backend::DEVICE_MASK))
    {
       // Optimized host path: thread + SIMD parallel CSR SpMV.
-      // See linalg/cpu_kernels.hpp for the kernel and rationale.
-      cpu_kernels::CSRAddMult(height, d_I, d_J, d_A, d_x, d_y, a);
+      // See linalg/cpu_kernels.hpp for the kernel and rationale. Use the
+      // nnz-balanced variant (cached row partition) when OpenMP is
+      // enabled and the matrix is large enough to benefit from threading.
+#if defined(MFEM_USE_OPENMP)
+      const int nthreads = omp_get_max_threads();
+      if (nthreads > 1 && height >= cpu_kernels::omp_threshold)
+      {
+         if (spmv_row_split_nthreads != nthreads ||
+             spmv_row_split_nnz != nnz ||
+             spmv_row_split == nullptr)
+         {
+            delete [] spmv_row_split;
+            spmv_row_split = new int[nthreads + 1];
+            cpu_kernels::CSRPartitionByNNZ(height, d_I, nthreads, spmv_row_split);
+            spmv_row_split_nthreads = nthreads;
+            spmv_row_split_nnz = nnz;
+         }
+         cpu_kernels::CSRAddMultBalanced(height, d_I, d_J, d_A, d_x, d_y, a,
+                                         nthreads, spmv_row_split);
+      }
+      else
+#endif
+      {
+         cpu_kernels::CSRAddMult(height, d_I, d_J, d_A, d_x, d_y, a);
+      }
    }
    else
    {
@@ -3579,6 +3602,10 @@ void SparseMatrix::Destroy()
 
    delete [] ColPtrJ;
    delete [] ColPtrNode;
+   delete [] spmv_row_split;
+   spmv_row_split = nullptr;
+   spmv_row_split_nthreads = 0;
+   spmv_row_split_nnz = -1;
 #ifdef MFEM_USE_MEMALLOC
    delete NodesMem;
 #endif

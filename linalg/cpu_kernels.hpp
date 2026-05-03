@@ -323,6 +323,225 @@ inline void DenseAddMult(const int height, const int width,
    }
 }
 
+// ---------------------------------------------------------------------------
+// NNZ-balanced row partitioning for parallel CSR SpMV.
+//
+// Static row partitioning (height/nthreads rows per thread) hands every
+// thread the same number of rows but a wildly different amount of work
+// when the matrix has a non-uniform sparsity pattern (refined or AMR
+// meshes, high-order elements). Splitting at row boundaries that
+// equalise the per-thread *nnz count* gives each thread roughly the
+// same amount of FMA work and removes load imbalance, which translates
+// to nearly linear strong scaling for memory-resident matrices.
+//
+// Output:
+//   row_split[0..nthreads] is filled such that
+//     row_split[0] == 0, row_split[nthreads] == height
+//   and Ip[row_split[t+1]] - Ip[row_split[t]] is approximately
+//   nnz/nthreads for each thread t.
+// The split is computed by binary search over the prefix-sum I[].
+// O(nthreads * log(height)) — negligible vs. one SpMV.
+// ---------------------------------------------------------------------------
+inline void CSRPartitionByNNZ(const int height,
+                              const int *MFEM_CPU_RESTRICT Ip,
+                              const int nthreads,
+                              int *MFEM_CPU_RESTRICT row_split)
+{
+   row_split[0] = 0;
+   row_split[nthreads] = height;
+   if (nthreads <= 1) { return; }
+   const long long nnz = Ip[height];
+   for (int t = 1; t < nthreads; t++)
+   {
+      const long long target = (nnz * t) / nthreads;
+      // Binary search for smallest r in [0, height] with Ip[r] >= target.
+      int lo = 0, hi = height;
+      while (lo < hi)
+      {
+         const int mid = (lo + hi) >> 1;
+         if ((long long)Ip[mid] < target) { lo = mid + 1; }
+         else                              { hi = mid; }
+      }
+      // Keep splits monotone (defensive — should already hold).
+      if (lo < row_split[t-1]) { lo = row_split[t-1]; }
+      row_split[t] = lo;
+   }
+}
+
+// CSR SpMV with a precomputed nnz-balanced row partition.
+// row_split has length nthreads+1 (use CSRPartitionByNNZ to fill it).
+// For matrices with a uniform row length the result is identical to
+// CSRAddMult; for irregular matrices the parallel speedup approaches
+// nthreads instead of being capped by the slowest row band.
+inline void CSRAddMultBalanced(const int /*height*/,
+                               const int *MFEM_CPU_RESTRICT Ip,
+                               const int *MFEM_CPU_RESTRICT Jp,
+                               const real_t *MFEM_CPU_RESTRICT Ap,
+                               const real_t *MFEM_CPU_RESTRICT xp,
+                               real_t *MFEM_CPU_RESTRICT yp,
+                               const real_t a,
+                               const int nthreads,
+                               const int *MFEM_CPU_RESTRICT row_split)
+{
+#if defined(MFEM_USE_OPENMP)
+   #pragma omp parallel num_threads(nthreads)
+   {
+      const int tid = omp_get_thread_num();
+      const int rb = row_split[tid];
+      const int re = row_split[tid + 1];
+      for (int i = rb; i < re; i++)
+      {
+         const int rs = Ip[i];
+         const int rsp = Ip[i+1];
+         real_t d = 0.0;
+         #pragma omp simd reduction(+:d)
+         for (int j = rs; j < rsp; j++)
+         {
+            d += Ap[j] * xp[Jp[j]];
+         }
+         yp[i] += a * d;
+      }
+   }
+#else
+   (void)nthreads; (void)row_split;
+   const int H = row_split ? row_split[nthreads] : 0;
+   for (int i = 0; i < H; i++)
+   {
+      const int rs = Ip[i], re = Ip[i+1];
+      real_t d = 0.0;
+      for (int j = rs; j < re; j++) { d += Ap[j] * xp[Jp[j]]; }
+      yp[i] += a * d;
+   }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Multi-vector dot product (single-pass, single-Allreduce friendly).
+//
+//   out[k] = sum_i x[k][i] * y[i]   for k = 0 .. K-1
+//
+// In a parallel iterative solver each global dot product triggers an
+// MPI_Allreduce; collapsing K logically-independent dots into a single
+// kernel lets the caller do *one* batched Allreduce on a length-K
+// buffer instead of K. On the compute side it also amortises the read
+// of y[] across K dots, halving (or quartering) the bandwidth bill.
+//
+// Memory layout: x is an array of K vector pointers, each of length N.
+// ---------------------------------------------------------------------------
+inline void DotMulti(const int N, const int K,
+                     const real_t *const *MFEM_CPU_RESTRICT x,
+                     const real_t *MFEM_CPU_RESTRICT y,
+                     real_t *MFEM_CPU_RESTRICT out)
+{
+   for (int k = 0; k < K; k++) { out[k] = 0.0; }
+#if defined(MFEM_USE_OPENMP)
+   if (N >= omp_threshold)
+   {
+      const int nt = omp_get_max_threads();
+      // Per-thread accumulators. Keep the buffer cache-line padded to
+      // avoid false sharing between threads on the same K-row.
+      const int pad = 8; // 64 B / 8 B per real_t
+      const int stride = ((K + pad - 1) / pad) * pad;
+      real_t *acc = new real_t[(std::size_t)nt * stride]();
+      #pragma omp parallel
+      {
+         const int tid = omp_get_thread_num();
+         real_t *a_local = acc + (std::size_t)tid * stride;
+         #pragma omp for schedule(static) nowait
+         for (int i = 0; i < N; i++)
+         {
+            const real_t yi = y[i];
+            for (int k = 0; k < K; k++)
+            {
+               a_local[k] += x[k][i] * yi;
+            }
+         }
+      }
+      for (int t = 0; t < nt; t++)
+      {
+         for (int k = 0; k < K; k++)
+         {
+            out[k] += acc[(std::size_t)t * stride + k];
+         }
+      }
+      delete [] acc;
+      return;
+   }
+#endif
+   for (int i = 0; i < N; i++)
+   {
+      const real_t yi = y[i];
+      for (int k = 0; k < K; k++)
+      {
+         out[k] += x[k][i] * yi;
+      }
+   }
+}
+
+// ---------------------------------------------------------------------------
+// Fused AXPY + dot:  y += a * x;  return (y, y) computed *after* the AXPY.
+//
+// In CG inner loops we typically run
+//     r -= alpha * z;          // single sweep over r and z
+//     betanom = (r, r);        // second sweep over r
+// fusing both into one streaming kernel halves the bandwidth on r[].
+// ---------------------------------------------------------------------------
+inline real_t AxpyAndSelfDot(const int N, const real_t a,
+                             const real_t *MFEM_CPU_RESTRICT x,
+                             real_t *MFEM_CPU_RESTRICT y)
+{
+   real_t s = 0.0;
+#if defined(MFEM_USE_OPENMP)
+   #pragma omp parallel for simd reduction(+:s) schedule(static) \
+      if (N >= omp_threshold)
+#endif
+   for (int i = 0; i < N; i++)
+   {
+      const real_t yi = y[i] + a * x[i];
+      y[i] = yi;
+      s += yi * yi;
+   }
+   return s;
+}
+
+// ---------------------------------------------------------------------------
+// Diagonal-scaled SpMV (Jacobi preconditioner application + apply A in one
+// pass). Computes y += a * D^{-1} A x, where D is the inverse diagonal
+// already supplied as Dinv[].
+//
+// Useful inside Krylov solvers with a Jacobi preconditioner: the
+// classical implementation needs three streams (z = A x, then z *= Dinv,
+// then y += alpha z). This kernel folds them into a single sweep over
+// rows, halving traffic on z and removing one allocation.
+// ---------------------------------------------------------------------------
+inline void CSRDinvAddMult(const int height,
+                           const int *MFEM_CPU_RESTRICT Ip,
+                           const int *MFEM_CPU_RESTRICT Jp,
+                           const real_t *MFEM_CPU_RESTRICT Ap,
+                           const real_t *MFEM_CPU_RESTRICT Dinv,
+                           const real_t *MFEM_CPU_RESTRICT xp,
+                           real_t *MFEM_CPU_RESTRICT yp,
+                           const real_t a)
+{
+#if defined(MFEM_USE_OPENMP)
+   #pragma omp parallel for schedule(static) if (height >= omp_threshold)
+#endif
+   for (int i = 0; i < height; i++)
+   {
+      const int rb = Ip[i];
+      const int re = Ip[i+1];
+      real_t d = 0.0;
+      #if defined(MFEM_USE_OPENMP)
+      #pragma omp simd reduction(+:d)
+      #endif
+      for (int j = rb; j < re; j++)
+      {
+         d += Ap[j] * xp[Jp[j]];
+      }
+      yp[i] += a * Dinv[i] * d;
+   }
+}
+
 } // namespace cpu_kernels
 } // namespace mfem
 

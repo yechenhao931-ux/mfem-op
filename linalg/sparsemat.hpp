@@ -79,6 +79,13 @@ protected:
    /// Transpose of A. Owned. Used to perform MultTranspose() on devices.
    mutable SparseMatrix *At;
 
+   /// Cached nnz-balanced row partition for parallel host CSR SpMV
+   /// (lazily filled on the first AddMult/Mult call once OpenMP is in use).
+   /// Length is (nthreads+1); rebuilt whenever the underlying CSR changes.
+   mutable int *spmv_row_split = nullptr;
+   mutable int spmv_row_split_nthreads = 0;
+   mutable int spmv_row_split_nnz = -1;
+
 #ifdef MFEM_USE_MEMALLOC
    typedef MemAlloc <RowNode, 1024> RowNodeAlloc;
    RowNodeAlloc * NodesMem;
