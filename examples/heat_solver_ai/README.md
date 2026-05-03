@@ -37,9 +37,12 @@
 ```bash
 # 1) 先把 MFEM 串行版构建好（参见仓库根目录 INSTALL）
 cd <mfem-root>/examples
-make heat_bench
+make heat_bench                        # 已注册到 SEQ_EXAMPLES，make all 也能带上
 
-# 2) 跑全部组合，约几十秒到几分钟（受限于 max-ref）
+# 2) 几秒钟联调：仅跑 iso × quad 几个尺度，确认管道通
+./heat_bench --smoke --output smoke.csv
+
+# 3) 完整跑一遍，几十秒到几分钟（受限于 max-ref）
 ./heat_bench --output heat_solver_data.csv
 
 # 常用选项
@@ -80,8 +83,40 @@ python3 train_solver_selector.py --csv ../heat_solver_data.csv
 产物：
 
 - `solver_selector.pt` — TorchScript 模型（**特征标准化已嵌入**，C++ 端直接喂原始特征向量即可）
-- `solver_selector_meta.json` — 类别表、特征顺序、验证准确率（人类可读，方便排查不一致）
-- `training_report.txt` — 验证集混淆矩阵
+- `solver_selector_meta.json` — 类别表、特征顺序、Top-1 / Top-3 验证准确率
+- `training_report.txt` — 验证集 Top-1/Top-3 + 混淆矩阵
+
+### 2.1 评估脚本
+
+光看准确率不够，因为「预测错」不一定意味着「慢得要命」——选了次优求解器
+但耗时只多了 5% 是可以接受的。`evaluate_solver_selector.py` 在测试 CSV 上
+计算 *regret*：`predicted_time / oracle_time`，并按问题类型切片：
+
+```bash
+python3 evaluate_solver_selector.py \
+    --csv ../heat_solver_data.csv \
+    --model solver_selector.pt
+```
+
+输出形如：
+
+```
+Top-1 准确率: 0.812
+Top-3 准确率: 0.964
+Regret (chosen/oracle):
+    mean = 1.07     ← 平均比最优只慢 7%
+    p90  = 1.21
+    max  = 1.93
+
+按问题类型:
+  problem      N    top1   regret
+  iso         28   0.857    1.04
+  aniso       24   0.792    1.08
+  conv        24   0.708    1.15
+  ...
+```
+
+如果 regret 的 mean 接近 1.0，那么即使 Top-1 只有 ~70%，模型仍然非常实用。
 
 ---
 
@@ -153,23 +188,34 @@ DOF=4225  nnz=33025  sym_ratio=0.000  is_spd=yes
 
 ## 4. 集成到自己的 MFEM 程序
 
-最小集成只需链接 `solver_predictor` 这一静态库：
+最小集成只需链接 `solver_predictor` 这一静态库。库里附带 `RecommendedSolver`
+工厂——按预测出的名字一行构造好预条件器和 Krylov 求解器，省去一长串
+`if/else if` 派发：
 
 ```cpp
 #include "solver_predictor.hpp"
+using mfem_ai::SolverPredictor;
+using mfem_ai::HeatProblemDescriptor;
+using mfem_ai::RecommendedSolver;
+using mfem_ai::SolverOptions;
 
 // ……组装好 SparseMatrix& A_sp、知道问题语义……
-mfem_ai::SolverPredictor pred("solver_selector.pt");
-mfem_ai::HeatProblemDescriptor d;
+SolverPredictor pred("solver_selector.pt");
+HeatProblemDescriptor d;
 d.problem = "iso"; d.mesh_type = "hex"; d.dim = 3; d.poly_order = 1;
 d.n_dof = fes.GetTrueVSize(); d.n_elements = mesh.GetNE();
 mfem_ai::ExtractMatrixFeatures(A_sp, d);
 
-if (pred.Predict(d) == "PCG_GS") {
-   GSSmoother prec(A_sp);
-   CGSolver cg; cg.SetPreconditioner(prec); /* ... */
-}
+SolverOptions opts;     // rtol=1e-8, atol=1e-12, max_iter=3000, kdim=50
+RecommendedSolver rs(pred.Predict(d), A_sp, opts);
+rs.Solve(B, x);
+
+std::cout << rs.Name() << " iters=" << rs.NumIterations()
+          << " converged=" << rs.Converged() << "\n";
 ```
+
+如果想自己处理求解器实例化，只调 `pred.Predict(d)` / `pred.PredictAll(d)`
+即可，工厂部分完全可选。
 
 ---
 

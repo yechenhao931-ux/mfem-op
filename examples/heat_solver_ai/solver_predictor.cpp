@@ -204,4 +204,90 @@ std::string SolverPredictor::Predict(const HeatProblemDescriptor& d) const
    return PredictAll(d).front().first;
 }
 
+// ====================================================================
+// 求解器工厂实现
+// ====================================================================
+struct RecommendedSolver::Internal {
+   std::unique_ptr<mfem::Solver> prec;        // 预条件器（可空）
+   std::unique_ptr<mfem::Solver> solver;      // 主求解器
+   mfem::IterativeSolver*        iter = nullptr;  // 当为迭代法时，指向 solver
+};
+
+RecommendedSolver::RecommendedSolver(std::string name, mfem::SparseMatrix& A,
+                                     SolverOptions opts)
+   : name_(std::move(name)), internal_(new Internal())
+{
+   using namespace mfem;
+   auto& I = *internal_;
+
+   // 预条件器
+   if (name_ == "PCG_Jacobi" || name_ == "GMRES_Jacobi" ||
+       name_ == "BiCGSTAB_Jacobi") {
+      I.prec.reset(new DSmoother(A, 0));
+   } else if (name_ == "PCG_GS") {
+      I.prec.reset(new GSSmoother(A));
+   } else if (name_ == "PCG_Cheby") {
+      I.prec.reset(new DSmoother(A, 2));
+   }
+
+   auto setup_iter = [&](IterativeSolver* it) {
+      it->SetOperator(A);
+      it->SetRelTol(opts.rtol);
+      it->SetAbsTol(opts.atol);
+      it->SetMaxIter(opts.max_iter);
+      it->SetPrintLevel(opts.print_level);
+      if (I.prec) it->SetPreconditioner(*I.prec);
+      I.iter = it;
+   };
+
+   if (name_ == "CG" || name_ == "PCG_Jacobi" || name_ == "PCG_GS" ||
+       name_ == "PCG_Cheby") {
+      auto* cg = new CGSolver();
+      I.solver.reset(cg);
+      setup_iter(cg);
+   } else if (name_ == "MINRES") {
+      auto* mr = new MINRESSolver();
+      I.solver.reset(mr);
+      setup_iter(mr);
+   } else if (name_ == "GMRES" || name_ == "GMRES_Jacobi") {
+      auto* gm = new GMRESSolver();
+      I.solver.reset(gm);
+      gm->SetKDim(opts.gmres_kdim);
+      setup_iter(gm);
+   } else if (name_ == "BiCGSTAB" || name_ == "BiCGSTAB_Jacobi") {
+      auto* bs = new BiCGSTABSolver();
+      I.solver.reset(bs);
+      setup_iter(bs);
+   }
+#ifdef MFEM_USE_SUITESPARSE
+   else if (name_ == "DIRECT_UMF") {
+      auto* d = new UMFPackSolver();
+      I.solver.reset(d);
+      d->SetOperator(A);
+   }
+#endif
+   else {
+      throw std::invalid_argument(
+         "RecommendedSolver: 未知或当前编译选项不支持的求解器: " + name_);
+   }
+}
+
+RecommendedSolver::~RecommendedSolver() = default;
+
+bool RecommendedSolver::Solve(const mfem::Vector& B, mfem::Vector& x)
+{
+   internal_->solver->Mult(B, x);
+   if (internal_->iter) {
+      converged_ = internal_->iter->GetConverged();
+      iters_     = internal_->iter->GetNumIterations();
+      final_res_ = internal_->iter->GetFinalNorm();
+   } else {
+      // 直接法
+      converged_ = true;
+      iters_     = 1;
+      final_res_ = 0.0;
+   }
+   return converged_;
+}
+
 } // namespace mfem_ai

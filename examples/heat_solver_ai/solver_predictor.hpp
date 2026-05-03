@@ -18,7 +18,11 @@
 #include <utility>
 #include <vector>
 
-namespace mfem { class SparseMatrix; }
+namespace mfem {
+class SparseMatrix;
+class Solver;
+class Vector;
+}
 
 namespace mfem_ai {
 
@@ -82,6 +86,45 @@ public:
 private:
    struct Impl;
    std::unique_ptr<Impl> impl_;
+};
+
+// ----------------------------------------------------------------------
+// 求解器工厂 —— 用名字构造并执行 MFEM 迭代/直接法，封装预条件器生命周期。
+// ----------------------------------------------------------------------
+struct SolverOptions {
+   double rtol        = 1e-8;
+   double atol        = 1e-12;
+   int    max_iter    = 3000;
+   int    gmres_kdim  = 50;
+   int    print_level = 0;
+};
+
+// 包装一次「按名称求解」过程。预条件器与求解器一同管理生命周期；
+// 适合在用户代码里用 `solve(B, x)` 一行调用。
+class RecommendedSolver {
+public:
+   // name 必须是 SolverPredictor::Solvers() 里之一；不可识别会抛出异常。
+   RecommendedSolver(std::string name, mfem::SparseMatrix& A,
+                     SolverOptions opts = {});
+   ~RecommendedSolver();
+   RecommendedSolver(const RecommendedSolver&)            = delete;
+   RecommendedSolver& operator=(const RecommendedSolver&) = delete;
+
+   // 求解 A·x = B；返回 true 表示收敛（直接法恒为 true）。
+   bool Solve(const mfem::Vector& B, mfem::Vector& x);
+
+   const std::string& Name()           const { return name_; }
+   bool               Converged()      const { return converged_; }
+   int                NumIterations()  const { return iters_; }
+   double             FinalResidual()  const { return final_res_; }
+
+private:
+   struct Internal;
+   std::string name_;
+   std::unique_ptr<Internal> internal_;
+   bool   converged_ = false;
+   int    iters_     = 0;
+   double final_res_ = 0.0;
 };
 
 } // namespace mfem_ai

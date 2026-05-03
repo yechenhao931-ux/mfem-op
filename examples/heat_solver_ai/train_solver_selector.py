@@ -192,8 +192,12 @@ def train(args):
 
         model.eval()
         with torch.no_grad():
-            preds = model(Xv.to(device)).argmax(dim=1).cpu().numpy()
+            val_logits = model(Xv.to(device)).cpu().numpy()
+        preds   = val_logits.argmax(axis=1)
+        topk    = np.argsort(-val_logits, axis=1)[:, :3]
         val_acc = float((preds == y[val_idx]).mean())
+        val_top3 = float(np.mean([y[val_idx][i] in topk[i]
+                                  for i in range(len(val_idx))]))
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -202,11 +206,20 @@ def train(args):
 
         if (epoch + 1) % max(1, args.epochs // 10) == 0 or epoch == 0:
             print(f"  epoch {epoch+1:3d}/{args.epochs}  "
-                  f"loss={train_loss:.4f}  val_acc={val_acc:.3f}")
+                  f"loss={train_loss:.4f}  "
+                  f"val_acc={val_acc:.3f}  top3={val_top3:.3f}")
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    print(f"\n最佳验证准确率: {best_val_acc:.3f}")
+    # 重新跑一次最佳模型在 val 上以拿到最终预测
+    model.eval()
+    with torch.no_grad():
+        final_val_logits = model(Xv.to(device)).cpu().numpy()
+    preds = final_val_logits.argmax(axis=1)
+    topk  = np.argsort(-final_val_logits, axis=1)[:, :3]
+    final_top3 = float(np.mean([y[val_idx][i] in topk[i]
+                                for i in range(len(val_idx))]))
+    print(f"\n最佳验证 Top-1: {best_val_acc:.3f}  Top-3: {final_top3:.3f}")
 
     # ------------------------------------------------------------------
     # 导出 TorchScript（C++ 推理端通过 torch::jit::load 加载）
@@ -228,6 +241,7 @@ def train(args):
         "feature_dim":      int(X.shape[1]),
         "n_classes":        n_classes,
         "val_accuracy":     float(best_val_acc),
+        "val_top3":         float(final_top3),
         "training_size":    int(len(train_idx)),
         "val_size":         int(n_val),
     }
@@ -239,7 +253,8 @@ def train(args):
     # ------------------------------------------------------------------
     # 报告：验证集上每个真实标签的预测分布
     # ------------------------------------------------------------------
-    report = [f"val_accuracy = {best_val_acc:.4f}",
+    report = [f"val_top1 = {best_val_acc:.4f}",
+              f"val_top3 = {final_top3:.4f}",
               f"n_train = {len(train_idx)}, n_val = {n_val}\n"]
     cm = np.zeros((n_classes, n_classes), dtype=int)
     for true, pred in zip(y[val_idx], preds):

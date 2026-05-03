@@ -89,6 +89,17 @@ BenchConfig ParseArgs(int argc, char** argv) {
       else if (a == "--direct-max"  && i+1<argc) cfg.direct_max_dof= std::stoi(next());
       else if (a == "--no-direct")  cfg.run_direct = false;
       else if (a == "--verbose")    cfg.verbose    = true;
+      else if (a == "--smoke") {
+         // 烟雾测试：~30 次试验，几秒内跑完，用来联调流水线
+         cfg.min_ref      = 1; cfg.max_ref     = 2;
+         cfg.max_ref_3d   = 1;
+         cfg.order_min    = 1; cfg.order_max   = 1;
+         cfg.run_3d       = false;
+         cfg.run_aniso = cfg.run_var = cfg.run_react = false;
+         cfg.run_trans = cfg.run_conv = false;   // 仅留 iso
+         cfg.run_direct   = false;
+         cfg.max_iter     = 500;
+      }
       else if (a == "--dim") {
          std::string d = next();
          if (d == "2") cfg.run_3d = false;

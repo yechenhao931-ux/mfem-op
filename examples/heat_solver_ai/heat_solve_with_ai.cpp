@@ -50,73 +50,21 @@ double VarKappa(const Vector& x) {
    return 1.0 + 9.0 * std::exp(-r2 / 0.05);
 }
 
-// ----------------------------------------------------------------------
-// 按求解器名称运行一次 —— 与 heat_bench 中 RunSolver 同语义
-// ----------------------------------------------------------------------
+// 简单封装：调一次 RecommendedSolver 并返回 (耗时, 收敛, 迭代)
 struct SolveResult {
+   double time_ms = 0.0;
    bool   converged = false;
    int    iters = 0;
-   double time_ms = 0.0;
-   double rel_res = 0.0;
 };
 
-SolveResult Solve(const std::string& name, SparseMatrix& A,
-                  const Vector& B, Vector& x,
-                  double rtol, double atol, int max_iter, int kdim)
+SolveResult RunOnce(const std::string& name, SparseMatrix& A,
+                    const Vector& B, Vector& x,
+                    const SolverOptions& opts)
 {
-   SolveResult r;
-   std::unique_ptr<Solver> prec;
-   if (name == "PCG_Jacobi" || name == "GMRES_Jacobi" ||
-       name == "BiCGSTAB_Jacobi") prec.reset(new DSmoother(A, 0));
-   else if (name == "PCG_GS")     prec.reset(new GSSmoother(A));
-   else if (name == "PCG_Cheby")  prec.reset(new DSmoother(A, 2));
-
+   RecommendedSolver rs(name, A, opts);
    auto t0 = Clock::now();
-   if (name == "CG" || name == "PCG_Jacobi" || name == "PCG_GS" ||
-       name == "PCG_Cheby") {
-      CGSolver cg; cg.SetOperator(A);
-      cg.SetRelTol(rtol); cg.SetAbsTol(atol);
-      cg.SetMaxIter(max_iter); cg.SetPrintLevel(0);
-      if (prec) cg.SetPreconditioner(*prec);
-      cg.Mult(B, x);
-      r.converged = cg.GetConverged(); r.iters = cg.GetNumIterations();
-      r.rel_res   = cg.GetFinalNorm();
-   }
-   else if (name == "MINRES") {
-      MINRESSolver mr; mr.SetOperator(A);
-      mr.SetRelTol(rtol); mr.SetAbsTol(atol);
-      mr.SetMaxIter(max_iter); mr.SetPrintLevel(0);
-      mr.Mult(B, x);
-      r.converged = mr.GetConverged(); r.iters = mr.GetNumIterations();
-      r.rel_res   = mr.GetFinalNorm();
-   }
-   else if (name == "GMRES" || name == "GMRES_Jacobi") {
-      GMRESSolver gm; gm.SetOperator(A);
-      gm.SetRelTol(rtol); gm.SetAbsTol(atol);
-      gm.SetMaxIter(max_iter); gm.SetKDim(kdim); gm.SetPrintLevel(0);
-      if (prec) gm.SetPreconditioner(*prec);
-      gm.Mult(B, x);
-      r.converged = gm.GetConverged(); r.iters = gm.GetNumIterations();
-      r.rel_res   = gm.GetFinalNorm();
-   }
-   else if (name == "BiCGSTAB" || name == "BiCGSTAB_Jacobi") {
-      BiCGSTABSolver bs; bs.SetOperator(A);
-      bs.SetRelTol(rtol); bs.SetAbsTol(atol);
-      bs.SetMaxIter(max_iter); bs.SetPrintLevel(0);
-      if (prec) bs.SetPreconditioner(*prec);
-      bs.Mult(B, x);
-      r.converged = bs.GetConverged(); r.iters = bs.GetNumIterations();
-      r.rel_res   = bs.GetFinalNorm();
-   }
-#ifdef MFEM_USE_SUITESPARSE
-   else if (name == "DIRECT_UMF") {
-      UMFPackSolver direct; direct.SetOperator(A);
-      direct.Mult(B, x);
-      r.converged = true; r.iters = 1; r.rel_res = 0.0;
-   }
-#endif
-   r.time_ms = ms_since(t0);
-   return r;
+   bool ok = rs.Solve(B, x);
+   return { ms_since(t0), ok, rs.NumIterations() };
 }
 
 int main(int argc, char** argv)
@@ -273,15 +221,17 @@ int main(int argc, char** argv)
    std::string chosen = ranking.front().first;
    std::cout << "\n→ 选择: " << chosen << "\n";
 
+   SolverOptions opts;
+   opts.rtol = rtol; opts.atol = atol;
+   opts.max_iter = max_iter; opts.gmres_kdim = kdim;
+
    // 5) 用推荐求解器实际求解
    {
       Vector x(X.Size()); x = 0.0;
-      auto t0 = Clock::now();
-      auto r = Solve(chosen, A_sp, B, x, rtol, atol, max_iter, kdim);
-      double total = ms_since(t0);
+      auto r = RunOnce(chosen, A_sp, B, x, opts);
       std::cout << std::fixed << std::setprecision(2)
                 << "[" << chosen << "] iters=" << r.iters
-                << "  time=" << total << " ms"
+                << "  time=" << r.time_ms << " ms"
                 << "  converged=" << (r.converged ? "yes" : "no") << "\n";
    }
 
@@ -294,13 +244,11 @@ int main(int argc, char** argv)
          if (name == "DIRECT_UMF") continue;
 #endif
          Vector x(X.Size()); x = 0.0;
-         auto t0 = Clock::now();
-         auto r = Solve(name, A_sp, B, x, rtol, atol, max_iter, kdim);
-         double total = ms_since(t0);
+         auto r = RunOnce(name, A_sp, B, x, opts);
          std::cout << "  " << std::left << std::setw(18) << name
                    << "  iters=" << std::setw(5) << r.iters
                    << "  time=" << std::fixed << std::setprecision(2)
-                   << total << " ms"
+                   << r.time_ms << " ms"
                    << "  " << (r.converged ? "✓" : "✗") << "\n";
       }
    }
