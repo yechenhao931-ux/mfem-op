@@ -474,7 +474,10 @@ AssembledSystem AssembleHeat(const std::string& problem, Mesh& mesh,
       s.a->AddDomainIntegrator(new ConvectionIntegrator(*bc, -1.0));
    }
 
-   s.a->Assemble(); s.a->Finalize();
+   // skip_zeros=0：保留显式零元，避免 conv（含 ConvectionIntegrator）和
+   // aniso 高阶等情形把对称稀疏模式中本应配对的元素丢成结构非对称，
+   // 进而在 FormLinearSystem 的 EliminateRowCol 报 #4。
+   s.a->Assemble(0); s.a->Finalize(0);
    s.b->Assemble();
 
    s.x_sol.reset(new GridFunction(&fes));

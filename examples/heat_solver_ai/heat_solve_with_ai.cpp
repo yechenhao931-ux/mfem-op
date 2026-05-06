@@ -182,7 +182,9 @@ int main(int argc, char** argv)
       return 1;
    }
 
-   a.Assemble(); a.Finalize();
+   // skip_zeros=0：与 heat_bench 保持一致，避免某些组合（conv、高阶 aniso）
+   // 因丢弃显式零元导致 FormLinearSystem 的 EliminateRowCol #4。
+   a.Assemble(0); a.Finalize(0);
    b.Assemble();
 
    GridFunction x_sol(&fes); x_sol = 0.0;
